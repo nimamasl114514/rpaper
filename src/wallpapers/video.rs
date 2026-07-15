@@ -1,9 +1,9 @@
-//! 视频壁纸 — 用 ffmpeg 解码视频逐帧渲染
+//! 视频壁纸 — 内置 Media Foundation 解码，无需外部 ffmpeg
 //!
-//! ffmpeg 进程输出 raw RGBA 到 stdout，后台线程读取，
-//! 主线程每帧检查是否有新帧并上传到 GPU texture
+//! 优先使用 MF 内置解码，如果 MF 不可用则回退到 ffmpeg 管道。
 
 use crate::wallpaper::Wallpaper;
+use crate::mf_decoder::{MfDecoder, FrameSlot};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use wgpu::*;
@@ -19,8 +19,6 @@ struct Uniforms {
     _pad: f32,
 }
 
-type FrameSlot = Arc<Mutex<Option<Vec<u8>>>>;
-
 pub struct VideoWallpaper {
     pipeline: RenderPipeline,
     uniform_buffer: Buffer,
@@ -29,29 +27,25 @@ pub struct VideoWallpaper {
     frame_slot: FrameSlot,
     video_width: u32,
     video_height: u32,
-    _decode_thread: thread::JoinHandle<()>,
+    /// 后台解码线程，ffmpeg 回退时使用
+    _decode_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl VideoWallpaper {
     pub fn load(device: &Device, queue: &Queue, format: TextureFormat, path: PathBuf) -> Result<Self, String> {
-        if which::which("ffmpeg").is_err() {
-            return Err("未找到 ffmpeg，请安装 ffmpeg 并添加到 PATH。\n下载: https://ffmpeg.org/download.html".into());
-        }
+        // 优先用 Media Foundation 内置解码
+        let decoder = match MfDecoder::open(&path) {
+            Ok(d) => d,
+            Err(mf_err) => {
+                // MF 失败，回退到 ffmpeg
+                eprintln!("Media Foundation 解码失败: {mf_err}，回退到 ffmpeg");
+                return Self::load_ffmpeg(device, queue, format, path);
+            }
+        };
 
-        // 用 ffprobe 获取分辨率
-        let probe = std::process::Command::new("ffprobe")
-            .args(&["-v", "error", "-select_streams", "v:0",
-                     "-show_entries", "stream=width,height",
-                     "-of", "csv=p=0", path.to_str().unwrap()])
-            .output().map_err(|e| format!("ffprobe: {e}"))?;
+        let vw = decoder.width;
+        let vh = decoder.height;
 
-        let dims: Vec<u32> = String::from_utf8_lossy(&probe.stdout)
-            .trim().split(',').filter_map(|s| s.trim().parse().ok()).collect();
-        if dims.len() < 2 { return Err("无法读取视频分辨率".into()); }
-        let vw = dims[0];
-        let vh = dims[1];
-
-        // 创建纹理
         let texture = device.create_texture(&TextureDescriptor {
             label: Some("video_frame"),
             size: Extent3d { width: vw, height: vh, depth_or_array_layers: 1 },
@@ -60,6 +54,7 @@ impl VideoWallpaper {
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         });
+
         // 初始黑帧
         let black = vec![0u8; (vw * vh * 4) as usize];
         queue.write_texture(
@@ -117,7 +112,96 @@ impl VideoWallpaper {
             ],
         });
 
-        // 后台解码线程
+        Ok(Self {
+            pipeline, uniform_buffer, bind_group, texture,
+            frame_slot: decoder.frame_slot,
+            video_width: vw, video_height: vh,
+            _decode_thread: None,
+        })
+    }
+
+    /// ffmpeg 回退方案（原解码逻辑）
+    fn load_ffmpeg(device: &Device, queue: &Queue, format: TextureFormat, path: PathBuf) -> Result<Self, String> {
+        if which::which("ffmpeg").is_err() {
+            return Err("内置解码不可用，且未找到 ffmpeg。\n请安装 ffmpeg 并添加到 PATH: https://ffmpeg.org/download.html".into());
+        }
+
+        let probe = std::process::Command::new("ffprobe")
+            .args(&["-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=width,height",
+                     "-of", "csv=p=0", path.to_str().unwrap()])
+            .output().map_err(|e| format!("ffprobe: {e}"))?;
+
+        let dims: Vec<u32> = String::from_utf8_lossy(&probe.stdout)
+            .trim().split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        if dims.len() < 2 { return Err("无法读取视频分辨率".into()); }
+        let vw = dims[0];
+        let vh = dims[1];
+
+        let texture = device.create_texture(&TextureDescriptor {
+            label: Some("video_frame"),
+            size: Extent3d { width: vw, height: vh, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let black = vec![0u8; (vw * vh * 4) as usize];
+        queue.write_texture(
+            ImageCopyTexture { texture: &texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
+            &black,
+            ImageDataLayout { offset: 0, bytes_per_row: Some(vw * 4), rows_per_image: Some(vh) },
+            Extent3d { width: vw, height: vh, depth_or_array_layers: 1 },
+        );
+
+        let texture_view = texture.create_view(&TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("video_sampler_ff"),
+            mag_filter: FilterMode::Linear, min_filter: FilterMode::Linear,
+            address_mode_u: AddressMode::ClampToEdge, address_mode_v: AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("video_shader_ff"),
+            source: ShaderSource::Wgsl(include_str!("../../shaders/image.wgsl").into()),
+        });
+
+        let uniform_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("video_uniforms_ff"),
+            contents: bytemuck::bytes_of(&Uniforms { resolution: [2560.0, 1600.0], time: 0.0, _pad: 0.0 }),
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        });
+
+        let bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("video_bgl_ff"),
+            entries: &[
+                BindGroupLayoutEntry { binding: 0, visibility: ShaderStages::VERTEX_FRAGMENT, ty: BindingType::Buffer { ty: BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                BindGroupLayoutEntry { binding: 1, visibility: ShaderStages::FRAGMENT, ty: BindingType::Texture { sample_type: TextureSampleType::Float { filterable: true }, view_dimension: TextureViewDimension::D2, multisampled: false }, count: None },
+                BindGroupLayoutEntry { binding: 2, visibility: ShaderStages::FRAGMENT, ty: BindingType::Sampler(SamplerBindingType::Filtering), count: None },
+            ],
+        });
+
+        let pl = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("video_pl_ff"), bind_group_layouts: &[&bgl], push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("video_pipeline_ff"), layout: Some(&pl),
+            vertex: VertexState { module: &shader, entry_point: "vs_main", buffers: &[], compilation_options: Default::default() },
+            fragment: Some(FragmentState { module: &shader, entry_point: "fs_main", targets: &[Some(ColorTargetState { format, blend: Some(BlendState::REPLACE), write_mask: ColorWrites::ALL })], compilation_options: Default::default() }),
+            primitive: PrimitiveState::default(), depth_stencil: None, multisample: MultisampleState::default(), multiview: None, cache: None,
+        });
+
+        let bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("video_bg_ff"), layout: &bgl,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: BindingResource::Buffer(BufferBinding { buffer: &uniform_buffer, offset: 0, size: None }) },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&texture_view) },
+                BindGroupEntry { binding: 2, resource: BindingResource::Sampler(&sampler) },
+            ],
+        });
+
         let frame_slot: FrameSlot = Arc::new(Mutex::new(None));
         let slot_clone = frame_slot.clone();
         let path_clone = path.clone();
@@ -153,7 +237,7 @@ impl VideoWallpaper {
         Ok(Self {
             pipeline, uniform_buffer, bind_group, texture,
             frame_slot, video_width: vw, video_height: vh,
-            _decode_thread: decode_thread,
+            _decode_thread: Some(decode_thread),
         })
     }
 
@@ -195,5 +279,4 @@ impl Wallpaper for VideoWallpaper {
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.draw(0..6, 0..1);
     }
-
 }

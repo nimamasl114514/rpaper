@@ -6,6 +6,7 @@
 mod app;
 mod audio;
 mod desktop;
+mod mf_decoder;
 mod rwp;
 mod tray;
 mod wallpaper;
