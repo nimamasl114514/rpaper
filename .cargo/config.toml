@@ -1,0 +1,11 @@
+[build]
+# 24核 CPU 全部利用
+jobs = 24
+
+[profile.dev]
+# debug 模式增加 codegen-units 加快编译
+codegen-units = 16
+
+[profile.release]
+# release 模式减少 codegen-units 优化性能
+codegen-units = 1
