@@ -8,6 +8,7 @@ mod audio;
 mod desktop;
 mod mf_decoder;
 mod rwp;
+mod settings;
 mod tray;
 mod wallpaper;
 mod wallpapers;
@@ -16,6 +17,7 @@ use app::{App, WallpaperType};
 use std::path::PathBuf;
 use std::cell::RefCell;
 use tray::*;
+use settings::*;
 use windows::Win32::Foundation::{HWND, HINSTANCE, LPARAM, WPARAM, LRESULT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, PeekMessageW,
@@ -31,11 +33,13 @@ use windows::Win32::UI::Controls::Dialogs::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::core::{w, PCWSTR};
 use windows::Win32::UI::WindowsAndMessaging::PM_REMOVE;
+use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
 
 thread_local! {
     static APP: RefCell<Option<App>> = RefCell::new(None);
     static TRAY: RefCell<Option<TrayIcon>> = RefCell::new(None);
     static HIDDEN_HWND: RefCell<Option<HWND>> = RefCell::new(None);
+    static SETTINGS_HWND: RefCell<Option<HWND>> = RefCell::new(None);
 }
 
 fn parse_args() -> WallpaperType {
@@ -83,6 +87,36 @@ fn open_file_dialog(filter_video: bool) -> Option<PathBuf> {
         } else {
             None
         }
+    }
+}
+
+fn open_file_dialog_audio() -> Option<PathBuf> {
+    let hwnd = HIDDEN_HWND.with(|h| h.borrow().unwrap_or(HWND(0)));
+    unsafe {
+        let mut file_buf = [0u16; 260];
+        let filter: Vec<u16> = "音频文件\0*.mp3;*.wav;*.ogg;*.flac;*.m4a;*.aac\0所有文件\0*.*\0".encode_utf16().collect();
+        let mut ofn = OPENFILENAMEW {
+            lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+            hwndOwner: hwnd,
+            hInstance: HINSTANCE(0),
+            lpstrFilter: PCWSTR(filter.as_ptr()),
+            lpstrCustomFilter: windows::core::PWSTR::null(),
+            nMaxCustFilter: 0, nFilterIndex: 1,
+            lpstrFile: windows::core::PWSTR(file_buf.as_mut_ptr()),
+            nMaxFile: 260,
+            lpstrFileTitle: windows::core::PWSTR::null(), nMaxFileTitle: 0,
+            lpstrInitialDir: PCWSTR::null(),
+            lpstrTitle: PCWSTR::null(),
+            Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
+            nFileOffset: 0, nFileExtension: 0, lpstrDefExt: PCWSTR::null(),
+            lCustData: LPARAM(0), lpfnHook: None, lpTemplateName: PCWSTR::null(),
+            pvReserved: std::ptr::null_mut(), dwReserved: 0,
+            FlagsEx: windows::Win32::UI::Controls::Dialogs::OPEN_FILENAME_FLAGS_EX(0),
+        };
+        if GetOpenFileNameW(&mut ofn).as_bool() {
+            let len = file_buf.iter().position(|&c| c == 0).unwrap_or(0);
+            Some(PathBuf::from(String::from_utf16_lossy(&file_buf[..len])))
+        } else { None }
     }
 }
 
@@ -196,6 +230,137 @@ extern "system" fn hidden_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                             });
                         }
                     }
+                    IDM_SETTINGS | CMD_OPEN_SETTINGS => {
+                        // 打开设置窗口（如果已打开则前置）
+                        SETTINGS_HWND.with(|s| {
+                            let existing = s.borrow().unwrap_or(HWND(0));
+                            if existing.0 != 0 {
+                                let _ = SetForegroundWindow(existing);
+                            } else {
+                                match SettingsWindow::create(HWND(0)) {
+                                    Ok(win) => {
+                                        win.show();
+                                        let _ = SetForegroundWindow(win.hwnd);
+                                        let wp_id = APP.with(|a| {
+                                            a.borrow().as_ref()
+                                                .map(|app| app.current_wallpaper_id())
+                                                .unwrap_or(0)
+                                        });
+                                        update_wallpaper_selection(win.hwnd, wp_id);
+                                        SETTINGS_HWND.with(|s| *s.borrow_mut() = Some(win.hwnd));
+                                    }
+                                    Err(e) => show_error(&e),
+                                }
+                            }
+                        });
+                    }
+                    CMD_VOLUME_CHANGED => {
+                        let vol = lparam.0 as f32 / 100.0;
+                        APP.with(|a| { if let Some(app) = &mut *a.borrow_mut() { app.set_volume(vol); } });
+                    }
+                    CMD_WALLPAPER_CHANGED => {
+                        let radio_id = lparam.0 as u16;
+                        let wp = match radio_id {
+                            IDC_RADIO_AURORA => WallpaperType::Aurora,
+                            IDC_RADIO_PARTICLES => WallpaperType::Particles,
+                            IDC_RADIO_IMAGE => WallpaperType::Image,
+                            IDC_RADIO_VIDEO => WallpaperType::Video,
+                            _ => return LRESULT(0),
+                        };
+                        APP.with(|a| { if let Some(app) = &mut *a.borrow_mut() { app.switch_wallpaper(wp); } });
+                    }
+                    CMD_PAUSE_TOGGLE => {
+                        APP.with(|a| {
+                            if let Some(app) = &mut *a.borrow_mut() {
+                                let paused = app.toggle_pause();
+                                SETTINGS_HWND.with(|s| {
+                                    if let Some(hwnd) = s.borrow().as_ref() {
+                                        update_pause_button(*hwnd, paused);
+                                    }
+                                });
+                            }
+                        });
+                    }
+                    CMD_SELECT_IMAGE => {
+                        if let Some(path) = open_file_dialog(false) {
+                            APP.with(|a| {
+                                if let Some(app) = &mut *a.borrow_mut() {
+                                    if let Err(e) = app.load_file(path) { show_error(&e); }
+                                    SETTINGS_HWND.with(|s| {
+                                        if let Some(hwnd) = s.borrow().as_ref() {
+                                            update_wallpaper_selection(*hwnd, app.current_wallpaper_id());
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    }
+                    CMD_SELECT_VIDEO => {
+                        if let Some(path) = open_file_dialog(true) {
+                            APP.with(|a| {
+                                if let Some(app) = &mut *a.borrow_mut() {
+                                    if let Err(e) = app.load_file(path) { show_error(&e); }
+                                    SETTINGS_HWND.with(|s| {
+                                        if let Some(hwnd) = s.borrow().as_ref() {
+                                            update_wallpaper_selection(*hwnd, app.current_wallpaper_id());
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    }
+                    CMD_SELECT_PACKAGE => {
+                        if let Some(path) = open_file_dialog_rwp() {
+                            APP.with(|a| {
+                                if let Some(app) = &mut *a.borrow_mut() {
+                                    if let Err(e) = app.load_file(path) { show_error(&e); }
+                                    SETTINGS_HWND.with(|s| {
+                                        if let Some(hwnd) = s.borrow().as_ref() {
+                                            update_wallpaper_selection(*hwnd, app.current_wallpaper_id());
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    }
+                    CMD_OPEN_AUDIO => {
+                        if let Some(path) = open_file_dialog_audio() {
+                            APP.with(|a| {
+                                if let Some(app) = &mut *a.borrow_mut() {
+                                    match app.load_audio_file(&path) {
+                                        Ok(()) => {
+                                            let name = path.file_name()
+                                                .and_then(|n| n.to_str())
+                                                .unwrap_or("已加载");
+                                            SETTINGS_HWND.with(|s| {
+                                                if let Some(hwnd) = s.borrow().as_ref() {
+                                                    update_audio_label(*hwnd, name);
+                                                }
+                                            });
+                                        }
+                                        Err(e) => show_error(&e),
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    CMD_AUTOSTART_TOGGLE => {
+                        // 开机自启: 写注册表
+                        let exe = std::env::current_exe().unwrap_or_default();
+                        let exe_path = exe.to_string_lossy().to_string();
+                        let _ = windows::Win32::System::Registry::RegSetKeyValueW(
+                            windows::Win32::System::Registry::HKEY_CURRENT_USER,
+                            windows::core::w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run"),
+                            windows::core::w!("Rpaper"),
+                            windows::Win32::System::Registry::REG_SZ.0,
+                            Some(exe_path.as_ptr() as *const _),
+                            ((exe_path.len() + 1) * 2) as u32,
+                        );
+                    }
+                    0xDEAD => {
+                        // 设置窗口已关闭
+                        SETTINGS_HWND.with(|s| *s.borrow_mut() = None);
+                    }
                     IDM_EXIT => { PostQuitMessage(0); }
                     _ => {}
                 }
@@ -238,6 +403,7 @@ fn main() {
 
     let hidden_hwnd = create_hidden_window();
     HIDDEN_HWND.with(|h| *h.borrow_mut() = Some(hidden_hwnd));
+    settings::set_hidden_hwnd(hidden_hwnd);
 
     let tray = match TrayIcon::new(hidden_hwnd) {
         Ok(t) => t,

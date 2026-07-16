@@ -18,6 +18,7 @@ pub const IDM_IMAGE: usize = 1003;
 pub const IDM_VIDEO: usize = 1005;
 pub const IDM_PACKAGE: usize = 1006;
 pub const IDM_EXIT: usize = 1004;
+pub const IDM_SETTINGS: usize = 1007;
 
 pub struct TrayIcon { hwnd: HWND }
 
@@ -62,6 +63,8 @@ impl TrayIcon {
             let _ = AppendMenuW(hmenu, mk_flags(current_wallpaper == 3), IDM_VIDEO, vid_label);
             let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, w!(""));
             let _ = AppendMenuW(hmenu, MF_STRING, IDM_PACKAGE, w!("加载壁纸包 (.rwp)..."));
+            let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, w!(""));
+            let _ = AppendMenuW(hmenu, MF_STRING, IDM_SETTINGS, w!("设置..."));
             let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, w!(""));
             let _ = AppendMenuW(hmenu, MF_STRING, IDM_EXIT, w!("退出"));
 

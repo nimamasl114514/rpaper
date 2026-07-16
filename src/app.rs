@@ -55,6 +55,7 @@ pub struct App {
     image: ImageWallpaper,
     video: Option<VideoWallpaper>,
     audio: Option<AudioPlayer>,
+    paused: bool,
     start_time: Instant,
     last_frame: Instant,
     width: u32,
@@ -119,7 +120,7 @@ impl App {
 
         Self {
             surface, device, queue, config, wallpaper_type,
-            aurora, particles, image, video: None, audio: None,
+            aurora, particles, image, video: None, audio: None, paused: false,
             start_time: Instant::now(),
             last_frame: Instant::now(),
             width: width.max(1), height: height.max(1),
@@ -190,8 +191,25 @@ impl App {
     pub fn render(&mut self) -> Result<(), SurfaceError> {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32();
-        let elapsed = now.duration_since(self.start_time).as_secs_f32();
         self.last_frame = now;
+        
+        if self.paused {
+            // 暂停时仍然渲染当前帧（保持画面），但不更新时间
+            let frame = self.surface.get_current_texture()?;
+            let view = frame.texture.create_view(&TextureViewDescriptor::default());
+            let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor { label: None });
+            match self.wallpaper_type {
+                WallpaperType::Aurora => { self.aurora.render(&view, &mut encoder); }
+                WallpaperType::Particles => { self.particles.render(&view, &mut encoder); }
+                WallpaperType::Image => { self.image.render(&view, &mut encoder); }
+                WallpaperType::Video => { if let Some(v) = &self.video { v.render(&view, &mut encoder); } }
+            }
+            self.queue.submit(std::iter::once(encoder.finish()));
+            frame.present();
+            return Ok(());
+        }
+        
+        let elapsed = now.duration_since(self.start_time).as_secs_f32();
 
         let frame = self.surface.get_current_texture()?;
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
@@ -278,6 +296,39 @@ impl App {
             other => Err(format!("未知壁纸类型: {other}\n支持: shader/particles/image/video")),
         }
     }
+
+    pub fn set_volume(&mut self, vol: f32) {
+        let vol = vol.clamp(0.0, 1.0);
+        if let Some(audio) = &self.audio {
+            audio.set_volume(vol);
+        }
+    }
+
+    pub fn toggle_pause(&mut self) -> bool {
+        self.paused = !self.paused;
+        if self.paused {
+            if let Some(audio) = &self.audio { audio.pause(); }
+        } else {
+            if let Some(audio) = &self.audio { audio.resume(); }
+        }
+        self.paused
+    }
+
+    pub fn is_paused(&self) -> bool { self.paused }
+
+    pub fn load_audio_file(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let data = std::fs::read(path).map_err(|e| format!("读取音频文件失败: {e}"))?;
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_else(|| "mp3".into());
+        self.stop_audio();
+        let player = AudioPlayer::load_loop(data, &ext)?;
+        self.audio = Some(player);
+        Ok(())
+    }
+
+    pub fn has_audio(&self) -> bool { self.audio.is_some() }
 
     fn stop_audio(&mut self) {
         if let Some(audio) = self.audio.take() {
