@@ -4,7 +4,7 @@
 
 GPU 加速的 Windows 动态壁纸引擎
 
-Rust + wgpu (DirectX 12) · 60fps · ~6% CPU · 纯 Rust 视频解码
+Rust + wgpu (DirectX 12) · 60fps · ~6% CPU · openh264 全Profile视频解码
 
 </div>
 
@@ -13,22 +13,27 @@ Rust + wgpu (DirectX 12) · 60fps · ~6% CPU · 纯 Rust 视频解码
 - **极光效果** — 多层 simplex noise 极光幕布 + 星空 + 地平线辉光
 - **粒子效果** — GPU compute shader 驱动的浮动光点系统
 - **图片壁纸** — PNG / JPG / BMP / WebP / GIF，cover 铺满 + 呼吸效果
-- **视频壁纸** — 纯 Rust H.264 解码，支持 MP4/MKV/AVI/WebM/MOV，循环播放
+- **视频壁纸** — openh264 解码 (CABAC + B帧 + Main/High Profile)，支持 MP4，循环播放
 - **壁纸包 (.rwp)** — 打包格式，方便社区制作和分享壁纸
 - **Wallpaper Engine .pkg 兼容** — 直接导入 WE 的 video 类型 .pkg 壁纸
+- **Win11 设置窗口** — Mica 背景 + 卡片式分层布局 + DWM 圆角 + 字体颜色层次
+- **单实例 + 文件转发** — Mutex 互斥，第二实例通过 WM_COPYDATA 转发文件路径
 - **背景音乐** — 壁纸包可附带 MP3/WAV/OGG/FLAC 音频，循环播放
 - **系统壁纸集成** — 启动时保存原壁纸，退出时自动恢复
-- **文件关联** — 双击 .rwp 文件直接调起 Rpaper 加载
+- **文件关联** — 双击 .rwp/.pkg 文件直接调起 Rpaper 加载 + 右键菜单
 - **命令行加载** — `rpaper.exe path/to/file.mp4` 一行直接加载
-- **系统托盘** — 中文菜单，左键循环切换、双击打开设置、右键弹出菜单
-- **视频状态可视化** — 设置窗口实时显示视频解码状态与播放进度
-- **DPI 感知** — 自动适配高分辨率屏幕，无缩放模糊
-
-## 截图
-
-（运行后补充）
+- **系统托盘** — 自定义蓝紫R图标，左键循环切换、双击打开设置、右键弹出菜单
+- **音量控制** — 设置窗口滑块实时调节
+- **暂停/恢复** — 一键暂停壁纸动画
+- **开机自启** — 设置窗口复选框，注册表持久化
+- **配置持久化** — 壁纸类型/路径/音量/自启状态自动保存
+- **DPI 感知** — PerMonitorV2，自动适配高分辨率屏幕
 
 ## 快速开始
+
+### 下载安装
+
+从 [GitHub Releases](https://github.com/nimamasl114514/rpaper/releases) 下载 `Rpaper-Setup-0.2.0.exe`，双击安装即可。
 
 ### 命令行运行
 
@@ -59,23 +64,11 @@ rpaper.exe C:\path\to\image.png
 
 ### 文件关联双击打开
 
-首次运行 release 版本会自动注册 `.rwp` 文件关联（HKCU 级，无需 UAC）。
+首次运行 release 版本会自动注册 `.rwp` 和 `.pkg` 文件关联（HKCU 级，无需 UAC）。
 
-- 双击任意 `.rwp` 文件 → 自动调起 `rpaper.exe "<path>"` 加载
-- ProgID: `Rpaper.WallpaperPackage`
-- 图标使用 rpaper.exe 自带图标
-- 通过 `SHChangeNotify(SHCNE_ASSOCCHANGED)` 通知 Explorer 立即生效
-
-注册位置（如需手动清理）：
-
-```
-HKCU\Software\Classes\.rwp                       = Rpaper.WallpaperPackage
-HKCU\Software\Classes\Rpaper.WallpaperPackage    = "Rpaper 壁纸包"
-HKCU\Software\Classes\Rpaper.WallpaperPackage\DefaultIcon
-HKCU\Software\Classes\Rpaper.WallpaperPackage\shell\open\command  = "rpaper.exe" "%1"
-```
-
-debug 版本不自动注册，避免污染开发环境。
+- 双击任意 `.rwp` / `.pkg` 文件 → 自动调起 `rpaper.exe "<path>"` 加载
+- 视频/图片文件右键菜单 → "用 Rpaper 设置为壁纸"
+- 单实例检测：如果 Rpaper 已运行，新实例会通过 WM_COPYDATA 转发文件路径后退出
 
 ### 托盘菜单
 
@@ -100,13 +93,6 @@ debug 版本不自动注册，避免污染开发环境。
 ## 系统壁纸集成
 
 启动时通过 `IDesktopWallpaper` COM 接口保存原系统壁纸路径，并将桌面背景设为纯黑色，避免桌面图标后方透出旧壁纸影响观感。退出时（无论正常退出或崩溃 Drop）自动恢复原壁纸。
-
-实现要点：
-- RAII 守护 `SysWallpaperGuard` — Drop 时必定恢复
-- `CoInitializeEx(APARTMENTTHREADED)` 初始化 COM
-- `IDesktopWallpaper::GetWallpaper` 读取原壁纸
-- `IDesktopWallpaper::SetWallpaper(null, null)` + `SetBackgroundColor(0)` 设为纯色
-- `IDesktopWallpaper::SetWallpaper(null, original_path)` 恢复
 
 ## 壁纸包格式 (.rwp)
 
@@ -135,8 +121,6 @@ my-wallpaper.rwp (ZIP)
 
 制作方法：把文件按结构放好，压缩为 ZIP，后缀改为 `.rwp` 即可。
 
-详细文档见 [WALLPAPER_FORMAT.md](WALLPAPER_FORMAT.md)。
-
 ## Wallpaper Engine .pkg 兼容
 
 支持导入 Wallpaper Engine 导出的 `.pkg` 文件，**仅限 `video` 类型**。
@@ -147,15 +131,9 @@ my-wallpaper.rwp (ZIP)
 - 自动读取 `project.json` 元数据
 - 自动提取视频文件和音频文件
 
-不支持的类型（需要完整 Wallpaper Engine 渲染器）：
-- `scene` 类型（依赖 WE 的 scene 渲染管线）
-- `web` / `application` 类型（依赖 WE 的 Chromium 嵌入）
-
 导入方式：
 - 命令行：`rpaper.exe path/to/wallpaper.pkg`
 - 菜单：托盘右键 → 加载壁纸包 (.rwp)... → 选择 .pkg 文件
-
-如需使用 scene/web 类型壁纸，请在 Wallpaper Engine 编辑器中将壁纸导出为视频文件后导入。
 
 ## 技术架构
 
@@ -176,13 +154,13 @@ Progman (桌面外壳)
 .rwp / .pkg / .mp4
         │
         ▼
-   Mp4Demuxer        (纯 Rust MP4 解析)
+   Mp4Demuxer        (纯 Rust MP4 容器解析)
         │
         ▼
-   H264Decoder       (纯 Rust H.264 解码, CAVLC + CABAC)
+   openh264          (Cisco H.264 解码, CABAC + B帧 + 全Profile)
         │
         ▼
-   YUV420 → RGBA     (SIMD-friendly 色彩转换)
+   YUV420 → RGBA     (SSE4.1 SIMD 色彩转换)
         │
         ▼
    wgpu Texture      (GPU 上传)
@@ -191,7 +169,7 @@ Progman (桌面外壳)
    Full-screen Quad  (shader 渲染)
 ```
 
-无任何外部依赖（不需要 ffmpeg / Media Foundation / LAV）。
+三缓冲零拷贝：解码线程 → FrameSlot → UI 线程，每帧只搬 Vec 指针。
 
 ### 性能
 
@@ -200,7 +178,8 @@ Progman (桌面外壳)
 | 帧率 | 60fps (VSync) |
 | CPU | ~6% (24核, 约 0.25 核) |
 | 内存 | ~141MB |
-| 二进制 | 6.7MB |
+| 二进制 | 7.4MB (含 openh264 静态链接) |
+| 安装包 | 4.15MB |
 
 ### 优化
 
@@ -208,21 +187,21 @@ Progman (桌面外壳)
 - Aurora 着色器 4 层 fbm + 优化 hash，三层独立极光幕布
 - Fifo 呈现模式自动同步 VSync，不忙等
 - 子窗口拦截 `WM_ERASEBKGND` 防止系统背景擦除
-- `SetProcessDPIAware` 获取物理分辨率，避免缩放模糊
-- 视频解码后台线程 + 共享 frame_slot，渲染线程零拷贝上传
+- PerMonitorV2 DPI 感知，获取物理分辨率，避免缩放模糊
+- 视频解码后台线程 + 三缓冲零拷贝帧传递
+- openh264 静态链接，无额外 DLL 依赖
 
 ## 项目结构
 
 ```
 rpaper/
 ├── Cargo.toml
-├── WALLPAPER_FORMAT.md       # 壁纸包格式文档
 ├── src/
-│   ├── main.rs               # 入口 + 消息循环 + 托盘交互 + 命令行解析
-│   ├── app.rs                # wgpu 初始化 + 渲染管理 + 壁纸切换
+│   ├── main.rs               # 入口 + 消息循环 + 单实例 + WM_COPYDATA + 托盘
+│   ├── app.rs                # wgpu 初始化 + 渲染管理 + 壁纸切换 + 音量/暂停
 │   ├── desktop.rs            # WorkerW 窗口管理
 │   ├── tray.rs               # 系统托盘图标 + 菜单
-│   ├── settings.rs           # 设置窗口 (Win32 原生)
+│   ├── settings.rs           # Win11 设置窗口 (Mica + 卡片布局 + DWM圆角)
 │   ├── audio.rs              # 背景音乐播放 (rodio)
 │   ├── rwp.rs                # .rwp 壁纸包解析 (zip + serde)
 │   ├── pkg.rs                # Wallpaper Engine .pkg 解析 (LZ4)
@@ -234,31 +213,24 @@ rpaper/
 │   │   ├── aurora.rs         # 极光效果
 │   │   ├── particle.rs       # 粒子效果 (GPU compute)
 │   │   ├── image.rs          # 图片壁纸
-│   │   └── video.rs          # 视频壁纸 (纯 Rust 解码管线)
+│   │   └── video.rs          # 视频壁纸 (openh264 解码管线)
 │   └── video/
-│       ├── decoder.rs        # 解码器包装 + 状态/进度
-│       ├── color.rs          # YUV→RGBA 色彩转换
-│       ├── demux/            # 容器解析 (MP4)
-│       └── h264/             # H.264 解码 (CAVLC/CABAC/inter/intra/deblock)
-└── shaders/
-    ├── aurora.wgsl           # 极光着色器
-    ├── particle.wgsl         # 粒子渲染着色器
-    ├── particle_compute.wgsl # 粒子计算着色器
-    └── image.wgsl            # 图片/视频通用着色器
+│       ├── decoder.rs        # 解码器包装 + 三缓冲 + 状态/进度
+│       ├── color.rs          # YUV→RGBA (SSE4.1 SIMD)
+│       └── demux/            # MP4 容器解析
+├── res/                      # 多尺寸图标 (16~256px)
+├── shaders/                  # WGSL 着色器
+├── installer.iss             # Inno Setup 安装脚本
+└── scripts/                  # 测试脚本 + 图标生成
 ```
-
-## 扩展新壁纸
-
-1. 在 `src/wallpapers/` 下新建模块，实现 `Wallpaper` trait
-2. 在 `app.rs` 的 `WallpaperType` 和 `load_file` 中注册
-3. 在 `tray.rs` 和 `main.rs` 中添加菜单项
-4.（可选）打包为 `.rwp` 格式方便分享
 
 ## 编译
 
 ```bash
 cargo build --release
 ```
+
+openh264 通过 `openh264-sys2` crate 内嵌 C 源码，编译时自动构建，无需预安装。
 
 ## 环境要求
 
