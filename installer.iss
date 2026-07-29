@@ -2,7 +2,7 @@
 ; 用 Inno Setup 6 编译生成安装包
 
 #define MyAppName "Rpaper"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "Rpaper"
 #define MyAppExeName "rpaper.exe"
 

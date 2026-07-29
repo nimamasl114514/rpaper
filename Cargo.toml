@@ -1,6 +1,6 @@
 [package]
 name = "rpaper"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Rpaper - GPU-accelerated dynamic wallpaper engine for Windows"
 
@@ -40,6 +40,8 @@ zip = "2"
 rodio = "0.19"
 # LZ4 解压 — Wallpaper Engine .pkg 用 LZ4 块压缩
 lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
+# H.264 解码 — Cisco OpenH264，全 Profile 支持 (CABAC+B帧+子分区)
+openh264 = { version = "0.7", default-features = false, features = ["source"] }
 
 [profile.release]
 opt-level = 3
