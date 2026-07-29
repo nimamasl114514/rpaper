@@ -68,7 +68,7 @@ extern "system" fn find_defview_callback(hwnd: HWND, _lparam: LPARAM) -> BOOL {
 pub fn create_child_window(worker: HWND) -> io::Result<HWND> {
     unsafe {
         let hmodule = GetModuleHandleW(None)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e}")))?;
+            .map_err(|e| std::io::Error::other(format!("{e}")))?;
         let hinst = HINSTANCE(hmodule.0);
         let class_name = w!("WallpaperChild");
 
@@ -96,7 +96,7 @@ pub fn create_child_window(worker: HWND) -> io::Result<HWND> {
             0, 0, sw, sh, worker, HMENU(0), hinst, None,
         );
         if hwnd.0 == 0 {
-            return Err(io::Error::new(io::ErrorKind::Other, "CreateWindowExW returned null"));
+            return Err(std::io::Error::other("CreateWindowExW returned null"));
         }
 
         let _ = SetWindowPos(hwnd, HWND_TOP, 0, 0, sw, sh, SWP_NOACTIVATE | SWP_NOZORDER);

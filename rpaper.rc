@@ -1,0 +1,39 @@
+// Rpaper 资源文件 — 嵌入应用图标 + 版本信息
+// 由 build.rs 调用 Windows SDK rc.exe 编译为 .res 后链接到 exe
+
+// 图标资源 — IDI_APPLICATION(32512) 是窗口默认图标
+// 用 1 作为图标 ID，WNDCLASSEXW 加载时用 MAKEINTRESOURCEW(1)
+1 ICON "res/rpaper.ico"
+
+// 文件关联图标 — 用于 .rwp 文件
+2 ICON "res/rpaper.ico"
+
+// VersionInfo — exe 属性→详细信息
+1 VERSIONINFO
+FILEVERSION    0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEFLAGSMASK  0x3FL
+FILEFLAGS      0x0L
+FILEOS         0x40004L   // VOS_NT_WINDOWS32
+FILETYPE       0x1L       // VFT_APP
+FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"  // 简体中文 (0x0804) + Unicode (0x04B0)
+        BEGIN
+            VALUE "CompanyName",      "Rpaper"
+            VALUE "FileDescription",  "Rpaper Dynamic Wallpaper Engine"
+            VALUE "FileVersion",      "0.1.0"
+            VALUE "InternalName",     "rpaper"
+            VALUE "LegalCopyright",   "Copyright (C) 2026"
+            VALUE "OriginalFilename", "rpaper.exe"
+            VALUE "ProductName",      "Rpaper"
+            VALUE "ProductVersion",   "0.1.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 0x04B0
+    END
+END

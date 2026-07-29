@@ -38,8 +38,10 @@ pub struct WallpaperPackage {
     pub image_data: Option<Vec<u8>>,
     /// 图片文件名（用于推断格式）
     pub image_name: Option<String>,
-    /// 视频临时文件路径（video 类型，解压到临时目录）
+    /// 视频临时文件路径（video 类型，解压到临时目录；传给 VideoWallpaper）
     pub video_path: Option<std::path::PathBuf>,
+    /// 视频临时文件路径的清理句柄（Drop 时删除，避免 .rwp 临时文件泄漏）
+    pub temp_video_path: Option<std::path::PathBuf>,
     /// 音频数据
     pub audio_data: Option<Vec<u8>>,
     /// 音频文件名
@@ -58,13 +60,14 @@ impl WallpaperPackage {
         let mut image_data: Option<Vec<u8>> = None;
         let mut image_name: Option<String> = None;
         let mut video_path: Option<std::path::PathBuf> = None;
+        let mut temp_video_path: Option<std::path::PathBuf> = None;
         let mut audio_data: Option<Vec<u8>> = None;
         let mut audio_name: Option<String> = None;
 
         // 先读 manifest
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zip entry: {e}")))?;
+                .map_err(|e| std::io::Error::other(format!("zip entry: {e}")))?;
             let name = entry.name().to_string();
 
             if name == "manifest.json" || name.ends_with("/manifest.json") {
@@ -81,7 +84,7 @@ impl WallpaperPackage {
         // 根据类型读取资源
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zip entry: {e}")))?;
+                .map_err(|e| std::io::Error::other(format!("zip entry: {e}")))?;
             let name = entry.name().to_string();
             let lower = name.to_lowercase();
 
@@ -105,36 +108,40 @@ impl WallpaperPackage {
             }
 
             // 图片
-            if manifest.wallpaper_type == "image" {
-                if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")
-                    || lower.ends_with(".bmp") || lower.ends_with(".webp") || lower.ends_with(".gif") {
-                    let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf)?;
-                    image_data = Some(buf);
-                    image_name = Some(name);
-                    continue;
-                }
+            if manifest.wallpaper_type == "image"
+                && (lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")
+                    || lower.ends_with(".bmp") || lower.ends_with(".webp") || lower.ends_with(".gif")) {
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf)?;
+                image_data = Some(buf);
+                image_name = Some(name);
+                continue;
             }
 
             // 视频 — 解压到临时文件
-            if manifest.wallpaper_type == "video" {
-                if lower.ends_with(".mp4") || lower.ends_with(".mkv") || lower.ends_with(".avi")
-                    || lower.ends_with(".webm") || lower.ends_with(".mov") || lower.ends_with(".flv") {
-                    let ext = Path::new(&name).extension()
-                        .and_then(|e| e.to_str()).unwrap_or("mp4");
-                    let tmp = std::env::temp_dir().join(format!("rpaper_video_{}.{}", 
-                        std::process::id(), ext));
-                    let mut file = std::fs::File::create(&tmp)?;
-                    io::copy(&mut entry, &mut file)?;
-                    video_path = Some(tmp);
-                    continue;
-                }
+            if manifest.wallpaper_type == "video"
+                && (lower.ends_with(".mp4") || lower.ends_with(".mkv") || lower.ends_with(".avi")
+                    || lower.ends_with(".webm") || lower.ends_with(".mov") || lower.ends_with(".flv")) {
+                let ext = Path::new(&name).extension()
+                    .and_then(|e| e.to_str()).unwrap_or("mp4");
+                // 用纳秒戳作为随机后缀，避免多实例/重入时撞名
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let tmp = std::env::temp_dir().join(format!("rpaper_video_{}_{}.{}",
+                    std::process::id(), nanos, ext));
+                let mut file = std::fs::File::create(&tmp)?;
+                io::copy(&mut entry, &mut file)?;
+                video_path = Some(tmp.clone());
+                temp_video_path = Some(tmp);
+                continue;
             }
         }
 
         Ok(Self {
             manifest, shader_source, image_data, image_name,
-            video_path, audio_data, audio_name,
+            video_path, temp_video_path, audio_data, audio_name,
         })
     }
 
@@ -160,5 +167,16 @@ impl WallpaperPackage {
         zip.finish()?;
 
         Ok(())
+    }
+}
+
+/// 释放时清理解压出的视频临时文件，避免 .rwp 资源泄漏。
+/// 注意：video_path 会被 VideoWallpaper::load 消费（移出），这里仅清理 temp_video_path。
+impl Drop for WallpaperPackage {
+    fn drop(&mut self) {
+        if let Some(p) = &self.temp_video_path {
+            // 文件可能已被删除或正被占用（Windows 下会失败），忽略错误
+            let _ = std::fs::remove_file(p);
+        }
     }
 }

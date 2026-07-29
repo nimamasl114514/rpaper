@@ -5,11 +5,12 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::core::w;
 use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    LoadIconW, IDI_APPLICATION, CreatePopupMenu, TrackPopupMenu, AppendMenuW, DestroyMenu,
+    CreatePopupMenu, TrackPopupMenu, AppendMenuW, DestroyMenu,
     GetCursorPos, SetForegroundWindow, PostMessageW, WM_COMMAND,
     TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD,
     MF_STRING, MF_SEPARATOR, MF_CHECKED, HMENU,
 };
+use crate::settings::load_app_icon;
 
 pub const WM_TRAYICON: u32 = 0x8000;
 pub const IDM_AURORA: usize = 1001;
@@ -25,8 +26,12 @@ pub struct TrayIcon { hwnd: HWND }
 impl TrayIcon {
     pub fn new(hwnd: HWND) -> io::Result<Self> {
         unsafe {
-            let icon = LoadIconW(None, IDI_APPLICATION)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e}")))?;
+            // 使用自定义蓝紫 R 图标（16px 小图标，适合托盘显示）
+            // 托盘图标推荐 16px，系统会自动缩放到 DPI 适配尺寸
+            let icon = load_app_icon(true);
+            if icon.0 == 0 {
+                return Err(std::io::Error::other("加载托盘图标失败"));
+            }
 
             let tip: Vec<u16> = "Rpaper\0".encode_utf16().collect();
             let mut nid = NOTIFYICONDATAW {
@@ -40,7 +45,7 @@ impl TrayIcon {
             nid.szTip[..tip_len].copy_from_slice(&tip[..tip_len]);
 
             if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
-                return Err(io::Error::new(io::ErrorKind::Other, "Shell_NotifyIconW failed"));
+                return Err(std::io::Error::other("Shell_NotifyIconW failed"));
             }
             Ok(Self { hwnd })
         }

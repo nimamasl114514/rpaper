@@ -1,3 +1,26 @@
 /target
 *.exe
 *.pdb
+
+# 调试日志和临时文件
+*.log
+p_err.log
+p_frame_debug.log
+p_out.log
+gen_err.log
+build.log
+color_check
+debug_sps.py
+debug_sps_pps.py
+gen_cavlc_tables.py
+cavlc_tables_generated.rs
+
+# 测试产物
+scripts/large_test.pkg
+scripts/test_results/
+
+# Trae IDE
+.trae/
+
+# 安装包输出
+installer/Output/

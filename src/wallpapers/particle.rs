@@ -236,7 +236,7 @@ impl Wallpaper for ParticleWallpaper {
             });
             pass.set_pipeline(&self.compute_pipeline);
             pass.set_bind_group(0, &self.bind_group_compute, &[]);
-            let groups = (PARTICLE_COUNT + 63) / 64;
+            let groups = PARTICLE_COUNT.div_ceil(64);
             pass.dispatch_workgroups(groups, 1, 1);
         }
 

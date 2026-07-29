@@ -24,8 +24,24 @@ pub struct ImageWallpaper {
 impl ImageWallpaper {
     pub fn load(device: &Device, queue: &Queue, format: TextureFormat, path: &Path) -> std::io::Result<Self> {
         let img = image::open(path)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("image: {e}")))?;
+            .map_err(|e| std::io::Error::other(format!("image: {e}")))?;
         let rgba = img.to_rgba8();
+        Ok(Self::from_rgba(device, queue, format, rgba, Some(path.to_string_lossy().into_owned())))
+    }
+
+    /// 从内存数据加载图片（用于 .rwp 壁纸包，避免写临时文件）。
+    /// `name` 仅用于标记 loaded_path（使 has_image() 仍有效），
+    /// 图片格式由 image::load_from_memory 从魔数自动识别，无需后缀推断。
+    pub fn load_from_memory(data: &[u8], name: &str, device: &Device, queue: &Queue, format: TextureFormat) -> Result<Self, String> {
+        let img = image::load_from_memory(data)
+            .map_err(|e| format!("image: {e}"))?;
+        let rgba = img.to_rgba8();
+        Ok(Self::from_rgba(device, queue, format, rgba, Some(name.to_string())))
+    }
+
+    /// 公共构造：从 RGBA 像素缓冲创建纹理 + 完成 pipeline/bind_group 组装。
+    /// `load` 与 `load_from_memory` 共用此逻辑。
+    fn from_rgba(device: &Device, queue: &Queue, format: TextureFormat, rgba: image::RgbaImage, loaded: Option<String>) -> Self {
         let (width, height) = (rgba.width(), rgba.height());
 
         let texture = device.create_texture(&TextureDescriptor {
@@ -51,7 +67,7 @@ impl ImageWallpaper {
             Extent3d { width, height, depth_or_array_layers: 1 },
         );
 
-        Ok(Self::finish(device, format, texture, Some(path.to_string_lossy().into_owned())))
+        Self::finish(device, format, texture, loaded)
     }
 
     pub fn placeholder(device: &Device, format: TextureFormat) -> Self {
