@@ -8,6 +8,7 @@ mod audio;
 mod config;
 mod desktop;
 mod error;
+mod library_ui;
 mod pkg;
 mod rwp;
 mod settings;
@@ -23,6 +24,7 @@ use std::path::PathBuf;
 use std::cell::RefCell;
 use tray::*;
 use settings::*;
+use library_ui::{LibraryUi, UiCommand};
 use crate::video::decoder::DecoderState;
 use windows::Win32::Foundation::{HWND, HINSTANCE, LPARAM, WPARAM, LRESULT};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -32,7 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WINDOW_EX_STYLE, WM_COMMAND, WM_COPYDATA, WM_DESTROY, WM_QUIT, WM_TIMER,
     WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
     SetProcessDPIAware, MessageBoxW, MB_OK, MB_ICONERROR,
-    SetTimer, KillTimer, FindWindowW, SendMessageW,
+    SetTimer, KillTimer, FindWindowW, SendMessageW, HMENU,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows::Win32::UI::Controls::Dialogs::{
@@ -97,10 +99,11 @@ fn acquire_single_instance() -> bool {
 fn forward_file_path(path: &std::path::Path) -> bool {
     unsafe {
         // 隐藏窗口类名 WallpaperMsg — 由 create_hidden_window 注册
-        let hwnd = FindWindowW(w!("WallpaperMsg"), PCWSTR::null());
-        if hwnd.0 == 0 {
-            return false;
-        }
+        // windows 0.62: FindWindowW 返回 Result<HWND>
+        let hwnd = match FindWindowW(w!("WallpaperMsg"), PCWSTR::null()) {
+            Ok(h) if !h.0.is_null() => h,
+            _ => return false,
+        };
 
         // UTF-16 路径 + null terminator
         let path_w: Vec<u16> = path
@@ -117,11 +120,12 @@ fn forward_file_path(path: &std::path::Path) -> bool {
         };
 
         // SendMessageW 同步 — 接收方处理完才返回，期间 path_w 必须存活（栈上有效）
+        // windows 0.62: wparam/lparam 需要 Some() 包装
         let _ = SendMessageW(
             hwnd,
             WM_COPYDATA,
-            WPARAM(0),
-            LPARAM(&cds as *const _ as isize),
+            Some(WPARAM(0)),
+            Some(LPARAM(&cds as *const _ as isize)),
         );
         true
     }
@@ -162,8 +166,9 @@ fn tray_left_click_action() {
 /// 优先级: .pkg 解压状态 > 视频解码状态 > 未加载提示
 /// 设置窗口未打开时直接返回，省一次锁
 fn refresh_video_status() {
-    let settings_hwnd = SETTINGS_HWND.with(|s| s.borrow().unwrap_or(HWND(0)));
-    if settings_hwnd.0 == 0 { return; }
+    // windows 0.62: HWND.0 是 *mut c_void，用 is_null() 判空
+    let settings_hwnd = SETTINGS_HWND.with(|s| s.borrow().unwrap_or(HWND(std::ptr::null_mut())));
+    if settings_hwnd.0.is_null() { return; }
 
     let (text, progress) = APP.with(|a| {
         let borrow = a.borrow();
@@ -200,18 +205,19 @@ fn refresh_video_status() {
         }
     });
     update_video_status(settings_hwnd, &text);
-    update_video_progress(settings_hwnd, progress);
+    // settings.rs update_video_progress 期望 0.0-1.0 比例，progress 是 0-100 的 u32
+    update_video_progress(settings_hwnd, progress as f32 / 100.0);
 }
 
 /// 打开设置窗口（已打开则前置）
 fn open_settings_window() {
     SETTINGS_HWND.with(|s| {
-        let existing = s.borrow().unwrap_or(HWND(0));
-        if existing.0 != 0 {
+        let existing = s.borrow().unwrap_or(HWND(std::ptr::null_mut()));
+        if !existing.0.is_null() {
             unsafe { let _ = SetForegroundWindow(existing); }
             return;
         }
-        match SettingsWindow::create(HWND(0)) {
+        match SettingsWindow::create(HWND(std::ptr::null_mut())) {
             Ok(win) => {
                 win.show();
                 unsafe { let _ = SetForegroundWindow(win.hwnd); }
@@ -232,11 +238,85 @@ fn open_settings_window() {
     });
 }
 
+/// 打开壁纸库窗口（Slint 实现，已打开则前置/显示）
+fn open_library_window() {
+    LIBRARY_UI.with(|ui| {
+        let mut borrow = ui.borrow_mut();
+        if borrow.is_none() {
+            // 首次打开：创建 UI（启动 UI 线程）
+            *borrow = Some(LibraryUi::new());
+        }
+        if let Some(lib) = borrow.as_ref() {
+            lib.show();
+        }
+    });
+}
+
+/// 处理 UI 线程发来的命令
+fn process_ui_command(cmd: UiCommand) {
+    match cmd {
+        UiCommand::Close => {
+            // 用户关闭窗口：退出 UI 线程，清理资源
+            LIBRARY_UI.with(|ui| *ui.borrow_mut() = None);
+        }
+        UiCommand::Minimize => {
+            // 最小化：通过 HWND 调用 ShowWindow(SW_MINIMIZE)
+            // TODO: 需要把 HWND 存起来才能最小化
+        }
+        UiCommand::AddWallpaper => {
+            // 打开文件选择对话框
+            let filter = "所有支持的文件\0*.mp4;*.mkv;*.avi;*.webm;*.mov;*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.gif;*.rwp;*.pkg\0所有文件\0*.*\0";
+            if let Some(path) = open_file_dialog(filter, "选择壁纸文件") {
+                if let Err(e) = load_file_and_persist(path, false) {
+                    show_error(&e);
+                }
+            }
+        }
+        UiCommand::SelectWallpaper(_id) => {
+            // 选中壁纸，更新右侧详情面板（目前使用默认数据）
+        }
+        UiCommand::ApplyWallpaper(id) => {
+            // 应用选中的壁纸
+            let wp_type = match id {
+                0 => WallpaperType::Video,
+                1 => WallpaperType::Aurora,
+                2 => WallpaperType::Particles,
+                3 => WallpaperType::Image,
+                _ => return,
+            };
+            APP.with(|a| {
+                if let Some(app) = &mut *a.borrow_mut() {
+                    app.switch_wallpaper(wp_type);
+                }
+            });
+        }
+        UiCommand::SetVolume(vol) => {
+            APP.with(|a| {
+                if let Some(app) = &mut *a.borrow_mut() {
+                    app.set_volume(vol);
+                }
+            });
+            CONFIG.with(|c| {
+                let mut cfg = c.borrow_mut();
+                cfg.volume = vol;
+                let _ = cfg.save();
+            });
+        }
+        UiCommand::Search(_text) => {
+            // TODO: 搜索壁纸
+        }
+        UiCommand::OpenSettings => {
+            open_settings_window();
+        }
+    }
+}
+
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
     static TRAY: RefCell<Option<TrayIcon>> = const { RefCell::new(None) };
     static HIDDEN_HWND: RefCell<Option<HWND>> = const { RefCell::new(None) };
     static SETTINGS_HWND: RefCell<Option<HWND>> = const { RefCell::new(None) };
+    static LIBRARY_UI: RefCell<Option<LibraryUi>> = const { RefCell::new(None) };
     static CONFIG: RefCell<AppConfig> = RefCell::new(AppConfig::default());
     /// 延迟弹窗错误槽 — WM_COPYDATA 处理期间不能调 MessageBoxW（会阻塞发送方进程）
     /// 错误先存这里，主循环释放 APP borrow 后取出弹窗
@@ -279,7 +359,7 @@ fn parse_args(config: &AppConfig) -> StartupTarget {
 }
 
 fn open_file_dialog(filter: &str, title: &str) -> Option<PathBuf> {
-    let hwnd = HIDDEN_HWND.with(|h| h.borrow().unwrap_or(HWND(0)));
+    let hwnd = HIDDEN_HWND.with(|h| h.borrow().unwrap_or(HWND(std::ptr::null_mut())));
     unsafe {
         let mut file_buf = [0u16; 260];
         let filter: Vec<u16> = filter.encode_utf16().collect();
@@ -288,7 +368,7 @@ fn open_file_dialog(filter: &str, title: &str) -> Option<PathBuf> {
         let mut ofn = OPENFILENAMEW {
             lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
             hwndOwner: hwnd,
-            hInstance: HINSTANCE(0),
+            hInstance: HINSTANCE(std::ptr::null_mut()),
             lpstrFilter: PCWSTR(filter.as_ptr()),
             lpstrCustomFilter: windows::core::PWSTR::null(),
             nMaxCustFilter: 0, nFilterIndex: 1,
@@ -316,11 +396,11 @@ fn open_file_dialog(filter: &str, title: &str) -> Option<PathBuf> {
 fn show_error(msg: &str) {
     // 走 RpaperError 分类，输出友好提示
     let friendly = error::RpaperError::from_message(msg).to_string();
-    let hwnd = HIDDEN_HWND.with(|h| h.borrow().unwrap_or(HWND(0)));
+    let hwnd = HIDDEN_HWND.with(|h| h.borrow().unwrap_or(HWND(std::ptr::null_mut())));
     let wstr: Vec<u16> = friendly.encode_utf16().chain(std::iter::once(0)).collect();
     let title: Vec<u16> = "Rpaper 错误\0".encode_utf16().collect();
     unsafe {
-        let _ = MessageBoxW(hwnd, PCWSTR(wstr.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
+        let _ = MessageBoxW(Some(hwnd), PCWSTR(wstr.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
     }
 }
 
@@ -339,14 +419,19 @@ fn reg_set_sz(subkey: &str, value_name: Option<&str>, value: &str) -> Result<(),
         None => PCWSTR::null(),
     };
     unsafe {
-        windows::Win32::System::Registry::RegSetKeyValueW(
+        // windows 0.62: RegSetKeyValueW 返回 WIN32_ERROR 而非 Result，不能 map_err
+        let res = windows::Win32::System::Registry::RegSetKeyValueW(
             windows::Win32::System::Registry::HKEY_CURRENT_USER,
             PCWSTR(subkey_w.as_ptr()),
             name_ptr,
             windows::Win32::System::Registry::REG_SZ.0,
             Some(value_w.as_ptr() as *const std::ffi::c_void),
             (value_w.len() * 2) as u32,
-        ).map_err(|e| format!("RegSetKeyValueW({subkey}) 失败: {e}"))
+        );
+        if res != windows::Win32::Foundation::NO_ERROR {
+            return Err(format!("RegSetKeyValueW({subkey}) 失败: {res:?}"));
+        }
+        Ok(())
     }
 }
 
@@ -431,12 +516,12 @@ extern "system" fn hidden_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     }
                     0x0202 /* WM_LBUTTONUP */ => {
                         // 启动双击去抖计时器，期间若收到 WM_LBUTTONDBLCLK 则取消单击动作
-                        let _ = SetTimer(hwnd, IDM_TRAY_CLICK_TIMER, GetDoubleClickTime(), None);
+                        let _ = SetTimer(Some(hwnd), IDM_TRAY_CLICK_TIMER, GetDoubleClickTime(), None);
                         LRESULT(0)
                     }
                     0x0203 /* WM_LBUTTONDBLCLK */ => {
                         // 双击 → 取消单击计时器，打开设置窗口
-                        let _ = KillTimer(hwnd, IDM_TRAY_CLICK_TIMER);
+                        let _ = KillTimer(Some(hwnd), IDM_TRAY_CLICK_TIMER);
                         open_settings_window();
                         LRESULT(0)
                     }
@@ -487,7 +572,7 @@ extern "system" fn hidden_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             WM_TIMER => {
                 // 托盘左键单击延时到达 → 执行单击切换
                 if wparam.0 == IDM_TRAY_CLICK_TIMER {
-                    let _ = KillTimer(hwnd, IDM_TRAY_CLICK_TIMER);
+                    let _ = KillTimer(Some(hwnd), IDM_TRAY_CLICK_TIMER);
                     tray_left_click_action();
                 } else if wparam.0 == IDM_VIDEO_STATUS_TIMER {
                     // 1 秒一次刷新设置窗口视频状态文本
@@ -585,11 +670,11 @@ extern "system" fn hidden_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     IDM_SETTINGS | CMD_OPEN_SETTINGS => {
                         // 打开设置窗口（如果已打开则前置）
                         SETTINGS_HWND.with(|s| {
-                            let existing = s.borrow().unwrap_or(HWND(0));
-                            if existing.0 != 0 {
+                            let existing = s.borrow().unwrap_or(HWND(std::ptr::null_mut()));
+                            if !existing.0.is_null() {
                                 let _ = SetForegroundWindow(existing);
                             } else {
-                                match SettingsWindow::create(HWND(0)) {
+                                match SettingsWindow::create(HWND(std::ptr::null_mut())) {
                                     Ok(win) => {
                                         win.show();
                                         let _ = SetForegroundWindow(win.hwnd);
@@ -611,6 +696,9 @@ extern "system" fn hidden_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                             }
                         });
                     }
+                    IDM_LIBRARY => {
+                        open_library_window();
+                    }
                     CMD_VOLUME_CHANGED => {
                         let vol = lparam.0 as f32 / 100.0;
                         APP.with(|a| { if let Some(app) = &mut *a.borrow_mut() { app.set_volume(vol); } });
@@ -623,10 +711,10 @@ extern "system" fn hidden_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     CMD_WALLPAPER_CHANGED => {
                         let radio_id = lparam.0 as u16;
                         let wp = match radio_id {
-                            IDC_RADIO_AURORA => WallpaperType::Aurora,
-                            IDC_RADIO_PARTICLES => WallpaperType::Particles,
-                            IDC_RADIO_IMAGE => WallpaperType::Image,
-                            IDC_RADIO_VIDEO => WallpaperType::Video,
+                            IDC_CARD_AURORA => WallpaperType::Aurora,
+                            IDC_CARD_PARTICLES => WallpaperType::Particles,
+                            IDC_CARD_IMAGE => WallpaperType::Image,
+                            IDC_CARD_VIDEO => WallpaperType::Video,
                             _ => return LRESULT(0),
                         };
                         APP.with(|a| { if let Some(app) = &mut *a.borrow_mut() { app.switch_wallpaper(wp); } });
@@ -815,6 +903,7 @@ extern "system" fn hidden_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 LRESULT(0)
             }
             WM_DESTROY => { PostQuitMessage(0); LRESULT(0) }
+            // windows 0.62: DefWindowProcW 签名 (HWND, u32, WPARAM, LPARAM) — 不需 Some 包装
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
@@ -822,25 +911,33 @@ extern "system" fn hidden_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
 fn create_hidden_window() -> Result<HWND, String> {
     unsafe {
-        let hinst = GetModuleHandleW(None).map_err(|e| format!("GetModuleHandleW: {e}"))?;
+        // windows 0.62: GetModuleHandleW 返回 Result<HMODULE>
+        let hmodule = GetModuleHandleW(None).map_err(|e| format!("GetModuleHandleW: {e}"))?;
+        // HMODULE → HINSTANCE: 两者底层都是 *mut c_void，直接拷 .0
+        let hinst = HINSTANCE(hmodule.0);
         let class_name = w!("WallpaperMsg");
 
         let wcex = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(hidden_wnd_proc),
-            hInstance: hinst.into(),
+            hInstance: hinst,
             lpszClassName: class_name,
             ..Default::default()
         };
         let _ = RegisterClassExW(&wcex);
 
-        Ok(CreateWindowExW(
+        // windows 0.62: CreateWindowExW
+        //   - hwndParent: Option<HWND>  (None 即可)
+        //   - hMenu:      HMENU         (非 Option，传 null 句柄)
+        //   - hInstance:  Option<HINSTANCE>
+        //   - 返回 Result<HWND>
+        CreateWindowExW(
             WINDOW_EX_STYLE(0), class_name, w!("WallpaperMsg"),
             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
             CW_USEDEFAULT, CW_USEDEFAULT,
-            None, None, hinst, None,
-        ))
+            None, Some(HMENU(std::ptr::null_mut())), Some(hinst), None,
+        ).map_err(|e| format!("CreateWindowExW: {e}"))
     }
 }
 
@@ -950,7 +1047,7 @@ fn main() {
     settings::set_hidden_hwnd(hidden_hwnd);
 
     // 启动视频状态刷新定时器 — 1 秒一次，函数内部会判断设置窗口是否打开
-    unsafe { let _ = SetTimer(hidden_hwnd, IDM_VIDEO_STATUS_TIMER, 1000, None); }
+    unsafe { let _ = SetTimer(Some(hidden_hwnd), IDM_VIDEO_STATUS_TIMER, 1000, None); }
 
     let tray = match TrayIcon::new(hidden_hwnd) {
         Ok(t) => t,
@@ -1057,5 +1154,22 @@ fn main() {
         if let Some(e) = pending_load_err {
             show_error(&e);
         }
+
+        // 处理 Slint UI 线程发来的命令（非阻塞轮询）
+        LIBRARY_UI.with(|ui| {
+            if let Some(lib) = ui.borrow().as_ref() {
+                loop {
+                    match lib.try_recv() {
+                        Ok(cmd) => process_ui_command(cmd),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            // UI 线程已退出，清理
+                            *ui.borrow_mut() = None;
+                            break;
+                        }
+                    }
+                }
+            }
+        });
     }
 }

@@ -1,0 +1,377 @@
+// Rpaper 壁纸库 UI — Win11 Fluent Design 风格
+// 极简可编译版本
+
+import { LineEdit, Slider, Button, ScrollView } from "std-widgets.slint";
+
+// === 全局逻辑单例：暴露回调给 Rust ===
+export global LibraryLogic {
+    callback close_clicked();
+    callback minimize_clicked();
+    callback add_wallpaper_clicked();
+    callback wallpaper_selected(int);
+    callback apply_clicked(int);
+    callback volume_changed(float);
+    callback search_changed(string);
+    callback open_settings();
+}
+
+// === 主窗口 ===
+export component LibraryWindow inherits Window {
+    title: "Rpaper 壁纸库";
+    width: 1100px;
+    height: 700px;
+    background: #202020;
+    no-frame: true;
+
+    // === 状态 ===
+    in-out property <int> selected-id: 0;
+    in-out property <float> volume: 0.5;
+    in-out property <[string]> wallpaper-names: [
+        "星空夜景.mp4", "极光 (内置)", "粒子流 (内置)", "渐变紫.jpg"
+    ];
+    in-out property <[color]> wallpaper-grad-top: [ #1a1a2e, #0f0c29, #000000, #667eea ];
+    in-out property <[color]> wallpaper-grad-bot: [ #0f3460, #24243e, #1a1a2e, #764ba2 ];
+
+    VerticalLayout {
+        padding: 0px;
+        spacing: 0px;
+
+        // === 标题栏 ===
+        Rectangle {
+            height: 48px;
+            background: transparent;
+            HorizontalLayout {
+                spacing: 12px;
+                Rectangle { width: 16px; }
+                // Logo
+                Rectangle {
+                    width: 28px; height: 28px; border-radius: 6px;
+                    background: @linear-gradient(135deg, #667eea, #764ba2);
+                    Text {
+                        text: "R"; font-size: 14px; font-weight: 700; color: white;
+                        horizontal-alignment: center; vertical-alignment: center;
+                    }
+                }
+                Text {
+                    text: "Rpaper 壁纸库"; font-size: 14px; font-weight: 600; color: white;
+                    vertical-alignment: center;
+                }
+                Rectangle { horizontal-stretch: 1; }
+
+                // 设置按钮
+                btn-settings := Rectangle {
+                    width: 46px; height: 32px; border-radius: 4px;
+                    property <bool> hover: false;
+                    background: btn-settings.hover ? #353535 : transparent;
+                    animate background { duration: 100ms; }
+                    Text {
+                        text: "⚙"; font-size: 14px; color: #b0b0b0;
+                        horizontal-alignment: center; vertical-alignment: center;
+                    }
+                    TouchArea {
+                        pointer-event => { btn-settings.hover = self.has-hover; }
+                        clicked => { LibraryLogic.open-settings(); }
+                    }
+                }
+
+                // 最小化
+                btn-min := Rectangle {
+                    width: 46px; height: 32px; border-radius: 4px;
+                    property <bool> hover: false;
+                    background: btn-min.hover ? #353535 : transparent;
+                    animate background { duration: 100ms; }
+                    Text {
+                        text: "─"; font-size: 12px; color: #b0b0b0;
+                        horizontal-alignment: center; vertical-alignment: center;
+                    }
+                    TouchArea {
+                        pointer-event => { btn-min.hover = self.has-hover; }
+                        clicked => { LibraryLogic.minimize-clicked(); }
+                    }
+                }
+
+                // 关闭
+                btn-close := Rectangle {
+                    width: 46px; height: 32px; border-radius: 4px;
+                    property <bool> hover: false;
+                    background: btn-close.hover ? #e81123 : transparent;
+                    animate background { duration: 100ms; }
+                    Text {
+                        text: "✕"; font-size: 12px;
+                        color: btn-close.hover ? white : #b0b0b0;
+                        horizontal-alignment: center; vertical-alignment: center;
+                    }
+                    TouchArea {
+                        pointer-event => { btn-close.hover = self.has-hover; }
+                        clicked => { LibraryLogic.close-clicked(); }
+                    }
+                }
+            }
+        }
+
+        // === 主内容区 ===
+        HorizontalLayout {
+            spacing: 0px;
+
+            // --- 左侧导航栏 ---
+            Rectangle {
+                width: 200px;
+                background: #252525;
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 4px;
+
+                    Text { text: "库"; font-size: 12px; font-weight: 600; color: #808080; }
+
+                    // 已安装
+                    nav-installed := Rectangle {
+                        height: 36px; border-radius: 4px;
+                        background: #404040;
+                        HorizontalLayout {
+                            Rectangle { width: 12px; }
+                            Text {
+                                text: "🖼 已安装"; font-size: 14px; color: white;
+                                vertical-alignment: center; horizontal-stretch: 1;
+                            }
+                            Rectangle { width: 12px; }
+                        }
+                    }
+
+                    Rectangle { height: 8px; }
+
+                    Text { text: "类型"; font-size: 12px; font-weight: 600; color: #808080; }
+                    Text { text: "🎬 视频"; font-size: 14px; color: #b0b0b0; }
+                    Text { text: "🖼 图片"; font-size: 14px; color: #b0b0b0; }
+                    Text { text: "✨ 特效"; font-size: 14px; color: #b0b0b0; }
+
+                    Rectangle { vertical-stretch: 1; }
+                }
+            }
+
+            // --- 中间内容 ---
+            VerticalLayout {
+                spacing: 0px;
+
+                // 工具栏
+                Rectangle {
+                    height: 56px;
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Rectangle { width: 24px; }
+                        Text {
+                            text: "已安装"; font-size: 22px; font-weight: 600; color: white;
+                            vertical-alignment: center;
+                        }
+
+                        // 搜索框
+                        search-box := Rectangle {
+                            width: 260px; height: 34px; border-radius: 6px;
+                            background: #333333;
+                            HorizontalLayout {
+                                Rectangle { width: 12px; }
+                                Text {
+                                    text: "🔍"; font-size: 14px; color: #808080;
+                                    vertical-alignment: center;
+                                }
+                                LineEdit {
+                                    placeholder-text: "搜索壁纸...";
+                                    font-size: 13px;
+                                    horizontal-stretch: 1;
+                                    edited(t) => { LibraryLogic.search-changed(t); }
+                                }
+                                Rectangle { width: 12px; }
+                            }
+                        }
+
+                        Rectangle { horizontal-stretch: 1; }
+
+                        // 添加按钮
+                        btn-add := Rectangle {
+                            height: 34px; min-width: 100px; border-radius: 8px;
+                            property <bool> hover: false;
+                            background: btn-add.hover ? #4aa8d8 : #60cdff;
+                            animate background { duration: 120ms; }
+                            HorizontalLayout {
+                                alignment: center;
+                                Text {
+                                    text: "＋ 添加壁纸"; font-size: 14px; font-weight: 500; color: black;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            TouchArea {
+                                pointer-event => { btn-add.hover = self.has-hover; }
+                                clicked => { LibraryLogic.add-wallpaper-clicked(); }
+                            }
+                        }
+
+                        Rectangle { width: 24px; }
+                    }
+                }
+
+                // 壁纸网格
+                ScrollView {
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 16px;
+
+                        HorizontalLayout {
+                            spacing: 16px;
+
+                            // 壁纸卡片循环
+                            for i in root.wallpaper-names.length : card := Rectangle {
+                                width: 200px; height: 200px; border-radius: 8px;
+                                property <bool> hover: false;
+                                property <bool> selected: root.selected-id == i;
+                                background: #2d2d2d;
+                                border-width: card.selected ? 2px : (card.hover ? 1px : 0px);
+                                border-color: card.selected ? #60cdff : (card.hover ? #5a5a5a : transparent);
+                                y: card.hover ? -2px : 0px;
+                                animate y, border-width, border-color { duration: 120ms; }
+
+                                VerticalLayout {
+                                    spacing: 0px;
+                                    // 预览区
+                                    Rectangle {
+                                        height: 140px;
+                                        background: @linear-gradient(135deg, root.wallpaper-grad-top[i], root.wallpaper-grad-bot[i]);
+                                        border-top-left-radius: 8px;
+                                        border-top-right-radius: 8px;
+                                    }
+                                    // 标题区
+                                    Rectangle {
+                                        height: 60px; background: #2d2d2d;
+                                        border-bottom-left-radius: 8px;
+                                        border-bottom-right-radius: 8px;
+                                        HorizontalLayout {
+                                            Rectangle { width: 12px; }
+                                            Text {
+                                                text: root.wallpaper-names[i]; font-size: 13px; color: white;
+                                                vertical-alignment: center; horizontal-stretch: 1;
+                                                overflow: elide;
+                                            }
+                                            Rectangle { width: 12px; }
+                                        }
+                                    }
+                                }
+
+                                TouchArea {
+                                    pointer-event => { card.hover = self.has-hover; }
+                                    clicked => {
+                                        root.selected-id = i;
+                                        LibraryLogic.wallpaper-selected(i);
+                                    }
+                                    double-clicked => {
+                                        root.selected-id = i;
+                                        LibraryLogic.apply-clicked(i);
+                                    }
+                                }
+                            }
+
+                            // 添加新壁纸卡片
+                            add-card := Rectangle {
+                                width: 200px; height: 200px; border-radius: 8px;
+                                border-width: 2px;
+                                property <bool> hover: false;
+                                border-color: add-card.hover ? #60cdff : #404040;
+                                background: #282828;
+                                animate border-color { duration: 120ms; }
+                                VerticalLayout {
+                                    alignment: center; spacing: 8px;
+                                    Text {
+                                        text: "＋"; font-size: 40px;
+                                        color: add-card.hover ? #60cdff : #606060;
+                                        horizontal-alignment: center;
+                                    }
+                                    Text {
+                                        text: "添加壁纸"; font-size: 13px;
+                                        color: add-card.hover ? #60cdff : #606060;
+                                        horizontal-alignment: center;
+                                    }
+                                }
+                                TouchArea {
+                                    pointer-event => { add-card.hover = self.has-hover; }
+                                    clicked => { LibraryLogic.add-wallpaper-clicked(); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- 右侧详情面板 ---
+            Rectangle {
+                width: 280px; background: #252525;
+                VerticalLayout {
+                    padding: 20px; spacing: 12px;
+
+                    // 预览图
+                    Rectangle {
+                        height: 160px; border-radius: 8px;
+                        background: @linear-gradient(135deg,
+                            root.wallpaper-grad-top[root.selected-id],
+                            root.wallpaper-grad-bot[root.selected-id]);
+                    }
+
+                    // 壁纸名
+                    Text {
+                        text: root.wallpaper-names[root.selected-id];
+                        font-size: 18px; font-weight: 600; color: white;
+                    }
+
+                    // 应用按钮
+                    btn-apply := Rectangle {
+                        height: 40px; border-radius: 8px;
+                        property <bool> hover: false;
+                        background: btn-apply.hover ? #4aa8d8 : #60cdff;
+                        animate background { duration: 120ms; }
+                        HorizontalLayout {
+                            alignment: center;
+                            Text {
+                                text: "▶ 应用壁纸"; font-size: 15px; font-weight: 600; color: black;
+                                vertical-alignment: center;
+                            }
+                        }
+                        TouchArea {
+                            pointer-event => { btn-apply.hover = self.has-hover; }
+                            clicked => { LibraryLogic.apply-clicked(root.selected-id); }
+                        }
+                    }
+
+                    Rectangle { height: 8px; }
+                    Rectangle { height: 1px; background: #3a3a3a; }
+                    Rectangle { height: 8px; }
+
+                    // 播放设置
+                    Text { text: "播放设置"; font-size: 13px; font-weight: 600; color: #808080; }
+
+                    // 音量控制
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Text {
+                            text: "🔊 音量"; font-size: 13px; color: white;
+                            vertical-alignment: center; width: 60px;
+                        }
+                        Slider {
+                            minimum: 0; maximum: 100;
+                            value: root.volume * 100;
+                            horizontal-stretch: 1;
+                            changed(v) => {
+                                root.volume = v / 100;
+                                LibraryLogic.volume-changed(v / 100);
+                            }
+                        }
+                    }
+
+                    Rectangle { vertical-stretch: 1; }
+
+                    // 底部状态
+                    Text {
+                        text: root.wallpaper-names.length + " 个壁纸已安装";
+                        font-size: 11px; color: #606060;
+                        horizontal-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}

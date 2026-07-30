@@ -1,4 +1,9 @@
-//! 视频壁纸 — 纯 Rust 解码管线，无需外部依赖
+//! 视频壁纸 — openh264 解码 + GPU YUV→RGB 转换
+//!
+//! 大封小切割策略：
+//! - decoder 产出打包 YUV（I420 planar, 无 stride）
+//! - 本模块按条带上传 3 个 R8 纹理 (Y/U/V)，GPU shader 做色彩转换
+//! - 零 CPU 色彩转换，内存占用降低 75%
 
 use crate::wallpaper::Wallpaper;
 use crate::video::decoder::{VideoDecoder, FrameSlot, DecoderStatus, DecoderState};
@@ -6,6 +11,9 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use wgpu::*;
 use std::path::PathBuf;
+
+/// 条带高度 — 每次上传 64 行 Y（32 行 UV），降低单次 write_texture 阻塞
+const STRIP_ROWS: u32 = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -19,7 +27,9 @@ pub struct VideoWallpaper {
     pipeline: RenderPipeline,
     uniform_buffer: Buffer,
     bind_group: BindGroup,
-    texture: Texture,
+    tex_y: Texture,
+    tex_u: Texture,
+    tex_v: Texture,
     frame_slot: FrameSlot,
     video_width: u32,
     video_height: u32,
@@ -34,25 +44,30 @@ impl VideoWallpaper {
         let vh = decoder.height;
         let frame_slot = decoder.frame_slot.clone();
 
-        let texture = device.create_texture(&TextureDescriptor {
-            label: Some("video_frame"),
-            size: Extent3d { width: vw, height: vh, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8UnormSrgb,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+        // 小切割：3 个 R8Unorm 纹理，分别存 Y/U/V 平面
+        // Y: full resolution, U/V: half resolution (4:2:0)
+        let tex_y = create_r8_texture(device, vw, vh, "video_y");
+        let tex_u = create_r8_texture(device, vw / 2, vh / 2, "video_u");
+        let tex_v = create_r8_texture(device, vw / 2, vh / 2, "video_v");
 
-        // 初始黑帧
-        let black = vec![0u8; (vw * vh * 4) as usize];
-        queue.write_texture(
-            ImageCopyTexture { texture: &texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
-            &black,
-            ImageDataLayout { offset: 0, bytes_per_row: Some(vw * 4), rows_per_image: Some(vh) },
-            Extent3d { width: vw, height: vh, depth_or_array_layers: 1 },
-        );
+        // 不分配黑帧 — 用 GPU clear 代替，省 8MB 临时内存
+        {
+            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("video_init_clear"),
+            });
+            for tex in [&tex_y, &tex_u, &tex_v] {
+                encoder.clear_texture(
+                    tex,
+                    &ImageSubresourceRange { aspect: TextureAspect::All, base_mip_level: 0, mip_level_count: None, base_array_layer: 0, array_layer_count: None },
+                );
+            }
+            queue.submit(std::iter::once(encoder.finish()));
+        }
 
-        let texture_view = texture.create_view(&TextureViewDescriptor::default());
+        let tex_y_view = tex_y.create_view(&TextureViewDescriptor::default());
+        let tex_u_view = tex_u.create_view(&TextureViewDescriptor::default());
+        let tex_v_view = tex_v.create_view(&TextureViewDescriptor::default());
+
         let sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("video_sampler"),
             mag_filter: FilterMode::Linear, min_filter: FilterMode::Linear,
@@ -62,7 +77,7 @@ impl VideoWallpaper {
 
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("video_shader"),
-            source: ShaderSource::Wgsl(include_str!("../../shaders/image.wgsl").into()),
+            source: ShaderSource::Wgsl(include_str!("../../shaders/video.wgsl").into()),
         });
 
         let uniform_buffer = device.create_buffer_init(&BufferInitDescriptor {
@@ -71,12 +86,15 @@ impl VideoWallpaper {
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         });
 
+        // 5 个 binding: uniform + Y + U + V + sampler
         let bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("video_bgl"),
             entries: &[
                 BindGroupLayoutEntry { binding: 0, visibility: ShaderStages::VERTEX_FRAGMENT, ty: BindingType::Buffer { ty: BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 BindGroupLayoutEntry { binding: 1, visibility: ShaderStages::FRAGMENT, ty: BindingType::Texture { sample_type: TextureSampleType::Float { filterable: true }, view_dimension: TextureViewDimension::D2, multisampled: false }, count: None },
-                BindGroupLayoutEntry { binding: 2, visibility: ShaderStages::FRAGMENT, ty: BindingType::Sampler(SamplerBindingType::Filtering), count: None },
+                BindGroupLayoutEntry { binding: 2, visibility: ShaderStages::FRAGMENT, ty: BindingType::Texture { sample_type: TextureSampleType::Float { filterable: true }, view_dimension: TextureViewDimension::D2, multisampled: false }, count: None },
+                BindGroupLayoutEntry { binding: 3, visibility: ShaderStages::FRAGMENT, ty: BindingType::Texture { sample_type: TextureSampleType::Float { filterable: true }, view_dimension: TextureViewDimension::D2, multisampled: false }, count: None },
+                BindGroupLayoutEntry { binding: 4, visibility: ShaderStages::FRAGMENT, ty: BindingType::Sampler(SamplerBindingType::Filtering), count: None },
             ],
         });
 
@@ -95,13 +113,16 @@ impl VideoWallpaper {
             label: Some("video_bg"), layout: &bgl,
             entries: &[
                 BindGroupEntry { binding: 0, resource: BindingResource::Buffer(BufferBinding { buffer: &uniform_buffer, offset: 0, size: None }) },
-                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&texture_view) },
-                BindGroupEntry { binding: 2, resource: BindingResource::Sampler(&sampler) },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&tex_y_view) },
+                BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&tex_u_view) },
+                BindGroupEntry { binding: 3, resource: BindingResource::TextureView(&tex_v_view) },
+                BindGroupEntry { binding: 4, resource: BindingResource::Sampler(&sampler) },
             ],
         });
 
         Ok(Self {
-            pipeline, uniform_buffer, bind_group, texture,
+            pipeline, uniform_buffer, bind_group,
+            tex_y, tex_u, tex_v,
             frame_slot,
             video_width: vw, video_height: vh,
             video_decoder: Some(decoder),
@@ -113,25 +134,70 @@ impl VideoWallpaper {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&Uniforms { resolution: [width, height], time, _pad: 0.0 }));
     }
 
+    /// 小切割：逐条带上传 YUV 数据到 3 个 GPU 纹理
+    /// 每条带 STRIP_ROWS 行 Y（对应 STRIP_ROWS/2 行 UV），
+    /// 降低单次 write_texture 的 PCIe 阻塞
     pub fn update_texture(&self, queue: &Queue) {
         if let Some(data) = self.frame_slot.take() {
-            queue.write_texture(
-                ImageCopyTexture { texture: &self.texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
-                &data,
-                ImageDataLayout { offset: 0, bytes_per_row: Some(self.video_width * 4), rows_per_image: Some(self.video_height) },
-                Extent3d { width: self.video_width, height: self.video_height, depth_or_array_layers: 1 },
-            );
-            // 用完归还到 pool，下一帧解码线程能复用，避免重新分配 8MB
+            let vw = self.video_width as usize;
+            let vh = self.video_height as usize;
+            let uv_w = vw / 2;
+            let uv_h = vh / 2;
+            let y_len = vw * vh;
+            let uv_len = uv_w * uv_h;
+
+            // Y 平面条带上传
+            let strip = STRIP_ROWS as usize;
+            let mut y = 0usize;
+            while y < vh {
+                let rows = strip.min(vh - y);
+                let offset = y * vw;
+                queue.write_texture(
+                    ImageCopyTexture { texture: &self.tex_y, mip_level: 0, origin: Origin3d { x: 0, y: y as u32, z: 0 }, aspect: TextureAspect::All },
+                    &data[offset..offset + rows * vw],
+                    ImageDataLayout { offset: 0, bytes_per_row: Some(vw as u32), rows_per_image: Some(rows as u32) },
+                    Extent3d { width: vw as u32, height: rows as u32, depth_or_array_layers: 1 },
+                );
+                y += rows;
+            }
+
+            // U 平面条带上传（半分辨率）
+            let uv_strip = strip / 2;
+            let mut uy = 0usize;
+            while uy < uv_h {
+                let rows = uv_strip.min(uv_h - uy);
+                let offset = y_len + uy * uv_w;
+                queue.write_texture(
+                    ImageCopyTexture { texture: &self.tex_u, mip_level: 0, origin: Origin3d { x: 0, y: uy as u32, z: 0 }, aspect: TextureAspect::All },
+                    &data[offset..offset + rows * uv_w],
+                    ImageDataLayout { offset: 0, bytes_per_row: Some(uv_w as u32), rows_per_image: Some(rows as u32) },
+                    Extent3d { width: uv_w as u32, height: rows as u32, depth_or_array_layers: 1 },
+                );
+                uy += rows;
+            }
+
+            // V 平面条带上传
+            let mut vy = 0usize;
+            while vy < uv_h {
+                let rows = uv_strip.min(uv_h - vy);
+                let offset = y_len + uv_len + vy * uv_w;
+                queue.write_texture(
+                    ImageCopyTexture { texture: &self.tex_v, mip_level: 0, origin: Origin3d { x: 0, y: vy as u32, z: 0 }, aspect: TextureAspect::All },
+                    &data[offset..offset + rows * uv_w],
+                    ImageDataLayout { offset: 0, bytes_per_row: Some(uv_w as u32), rows_per_image: Some(rows as u32) },
+                    Extent3d { width: uv_w as u32, height: rows as u32, depth_or_array_layers: 1 },
+                );
+                vy += rows;
+            }
+
             self.frame_slot.return_buf(data);
         }
     }
 
-    /// 转发解码器状态快照给上层 UI
     pub fn status(&self) -> Option<DecoderStatus> {
         self.video_decoder.as_ref().map(|d| d.status())
     }
 
-    /// 便捷查询：是否处于 Loading（首帧未出），UI 用来决定是否显示加载提示
     #[allow(dead_code)]
     pub fn is_loading(&self) -> bool {
         self.video_decoder.as_ref()
@@ -141,6 +207,18 @@ impl VideoWallpaper {
 
     pub fn video_width(&self) -> u32 { self.video_width }
     pub fn video_height(&self) -> u32 { self.video_height }
+}
+
+/// 创建 R8Unorm 纹理 — 存储单个 Y/U/V 平面
+fn create_r8_texture(device: &Device, w: u32, h: u32, label: &str) -> Texture {
+    device.create_texture(&TextureDescriptor {
+        label: Some(label),
+        size: Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1, sample_count: 1, dimension: TextureDimension::D2,
+        format: TextureFormat::R8Unorm,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
 }
 
 impl Wallpaper for VideoWallpaper {

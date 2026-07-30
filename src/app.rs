@@ -73,9 +73,12 @@ pub struct App {
     queue: Queue,
     config: SurfaceConfiguration,
     wallpaper_type: WallpaperType,
+    /// 常驻 — 极轻(~5KB) + 作为 Image/Video 未加载时的 fallback
     aurora: AuroraWallpaper,
-    particles: ParticleWallpaper,
-    image: ImageWallpaper,
+    /// 懒加载 — 切换到时才创建，切走时 drop 释放 GPU 资源
+    particles: Option<ParticleWallpaper>,
+    /// 懒加载 — 加载图片时才创建，切走时 drop
+    image: Option<ImageWallpaper>,
     video: Option<VideoWallpaper>,
     audio: Option<AudioPlayer>,
     /// 当前 .pkg 解出的临时视频文件，随 App 生命周期存活，避免文件过早释放
@@ -95,23 +98,49 @@ pub struct App {
 
 impl App {
     pub fn new(hwnd: HWND, wallpaper_type: WallpaperType) -> Result<Self, String> {
-        let wrapper = HwndWrapper { hwnd: hwnd.0 };
+        let wrapper = HwndWrapper { hwnd: hwnd.0 as isize };
         let (width, height) = desktop::get_window_size(hwnd);
 
+        // 多后端: 优先 DX12, 降级 Vulkan → Metal → GL
+        // wgpu 自动选择可用的后端, 无需手动 cfg
         let instance = Instance::new(InstanceDescriptor {
-            backends: Backends::DX12,
+            backends: Backends::DX12 | Backends::VULKAN | Backends::METAL | Backends::GL,
             ..Default::default()
         });
 
         let surface = instance.create_surface(wrapper)
             .map_err(|e| format!("创建 Surface 失败: {e}"))?;
 
+        // 多后端适配器选择 — 优先低功耗, 不强制 fallback
         let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
             power_preference: PowerPreference::LowPower,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
         }))
-        .ok_or("未找到兼容的 GPU 适配器（需要 DirectX 12）".to_string())?;
+        .or_else(|| {
+            // 首选失败, 尝试高性能适配器
+            pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+                power_preference: PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            }))
+        })
+        .or_else(|| {
+            // 仍然失败, 允许 fallback 适配器 (软渲染兜底)
+            pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+                power_preference: PowerPreference::None,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: true,
+            }))
+        })
+        .ok_or_else(|| {
+            let available = instance.enumerate_adapters(Backends::all());
+            let names: Vec<_> = available.iter()
+                .map(|a| a.get_info().name.clone())
+                .collect();
+            format!("未找到兼容的 GPU 适配器\n可用后端: {:?}\n可用适配器: {:?}", 
+                Backends::all(), if names.is_empty() { vec!["无".to_string()] } else { names })
+        })?;
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &DeviceDescriptor {
@@ -123,7 +152,7 @@ impl App {
                     max_storage_buffer_binding_size: 512 * 1024,
                     ..Limits::default()
                 },
-                memory_hints: MemoryHints::Performance,
+                memory_hints: MemoryHints::default(),
             },
             None,
         ))
@@ -150,12 +179,13 @@ impl App {
         surface.configure(&device, &config);
 
         let aurora = AuroraWallpaper::init(&device, &config, format);
-        let particles = ParticleWallpaper::init(&device, &config, format);
-        let image = ImageWallpaper::placeholder(&device, format);
 
         Ok(Self {
             surface, device, queue, config, wallpaper_type,
-            aurora, particles, image, video: None, audio: None, pkg_video: None,
+            aurora,
+            particles: None,  // 懒加载 — 切换到时才创建
+            image: None,      // 懒加载 — 加载图片时才创建
+            video: None, audio: None, pkg_video: None,
             pkg_extracting: None, pkg_error: None, pkg_error_shown: false,
             paused: false,
             start_time: Instant::now(),
@@ -164,8 +194,31 @@ impl App {
         })
     }
 
+    /// 分割包围：切换壁纸时 drop 非活跃实例释放 GPU 资源
+    /// Aurora 常驻（极轻 + fallback），其余按需创建/销毁
     pub fn switch_wallpaper(&mut self, wp: WallpaperType) {
         self.wallpaper_type = wp;
+        let format = self.config.format;
+
+        // 切走 Particles → drop 释放 2 个 pipeline + buffer
+        if wp != WallpaperType::Particles && self.particles.is_some() {
+            self.particles = None;
+        }
+        // 切走 Image → drop 释放纹理
+        if wp != WallpaperType::Image && self.image.is_some() {
+            self.image = None;
+        }
+        // 切走 Video → drop 释放 3 个 YUV 纹理 + 解码器
+        if wp != WallpaperType::Video && self.video.is_some() {
+            self.video = None;
+            self.stop_audio();
+            self.pkg_video = None;
+        }
+
+        // 切入 Particles → 懒创建
+        if wp == WallpaperType::Particles && self.particles.is_none() {
+            self.particles = Some(ParticleWallpaper::init(&self.device, &self.config, format));
+        }
     }
 
     /// 根据文件后缀自动选择壁纸类型并加载
@@ -195,7 +248,7 @@ impl App {
                 let format = self.config.format;
                 let new_image = ImageWallpaper::load(&self.device, &self.queue, format, &path)
                     .map_err(|e| e.to_string())?;
-                self.image = new_image;
+                self.image = Some(new_image);
                 self.wallpaper_type = WallpaperType::Image;
                 Ok(WallpaperType::Image)
             }
@@ -342,7 +395,7 @@ impl App {
             WallpaperType::Video => 3,
         }
     }
-    pub fn has_image(&self) -> bool { self.image.loaded_path().is_some() }
+    pub fn has_image(&self) -> bool { self.image.as_ref().is_some_and(|i| i.loaded_path().is_some()) }
     pub fn has_video(&self) -> bool { self.video.is_some() }
 
     /// 视频解码器状态快照（仅视频壁纸有意义，其他类型返回 None）
@@ -382,24 +435,7 @@ impl App {
             let frame = self.surface.get_current_texture()?;
             let view = frame.texture.create_view(&TextureViewDescriptor::default());
             let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor { label: None });
-            match self.wallpaper_type {
-                WallpaperType::Aurora => { self.aurora.render(&view, &mut encoder); }
-                WallpaperType::Particles => { self.particles.render(&view, &mut encoder); }
-                WallpaperType::Image => {
-                    if self.image.loaded_path().is_some() {
-                        self.image.render(&view, &mut encoder);
-                    } else {
-                        self.aurora.render(&view, &mut encoder);
-                    }
-                }
-                WallpaperType::Video => {
-                    if let Some(v) = &self.video {
-                        v.render(&view, &mut encoder);
-                    } else {
-                        self.aurora.render(&view, &mut encoder);
-                    }
-                }
-            }
+            self.render_wallpaper(&view, &mut encoder, 0.0, 0.0);
             self.queue.submit(std::iter::once(encoder.finish()));
             frame.present();
             return Ok(());
@@ -411,40 +447,55 @@ impl App {
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
 
         let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor { label: None });
+        self.render_wallpaper(&view, &mut encoder, elapsed, dt);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        frame.present();
+        Ok(())
+    }
 
+    /// 统一渲染入口 — 根据 wallpaper_type 分发，未加载的 fallback 到 Aurora
+    fn render_wallpaper(&self, view: &TextureView, encoder: &mut CommandEncoder, elapsed: f32, dt: f32) {
+        let w = self.width as f32;
+        let h = self.height as f32;
         match self.wallpaper_type {
             WallpaperType::Aurora => {
-                self.aurora.write_uniforms(&self.queue, self.width as f32, self.height as f32, elapsed);
-                self.aurora.render(&view, &mut encoder);
+                self.aurora.write_uniforms(&self.queue, w, h, elapsed);
+                self.aurora.render(view, encoder);
             }
             WallpaperType::Particles => {
-                self.particles.write_uniforms(&self.queue, self.width as f32, self.height as f32, elapsed, dt);
-                self.particles.render(&view, &mut encoder);
+                if let Some(p) = &self.particles {
+                    p.write_uniforms(&self.queue, w, h, elapsed, dt);
+                    p.render(view, encoder);
+                } else {
+                    self.aurora.write_uniforms(&self.queue, w, h, elapsed);
+                    self.aurora.render(view, encoder);
+                }
             }
             WallpaperType::Image => {
-                if self.image.loaded_path().is_some() {
-                    self.image.write_uniforms(&self.queue, self.width as f32, self.height as f32, elapsed);
-                    self.image.render(&view, &mut encoder);
+                if let Some(img) = &self.image {
+                    if img.loaded_path().is_some() {
+                        img.write_uniforms(&self.queue, w, h, elapsed);
+                        img.render(view, encoder);
+                    } else {
+                        self.aurora.write_uniforms(&self.queue, w, h, elapsed);
+                        self.aurora.render(view, encoder);
+                    }
                 } else {
-                    self.aurora.write_uniforms(&self.queue, self.width as f32, self.height as f32, elapsed);
-                    self.aurora.render(&view, &mut encoder);
+                    self.aurora.write_uniforms(&self.queue, w, h, elapsed);
+                    self.aurora.render(view, encoder);
                 }
             }
             WallpaperType::Video => {
                 if let Some(video) = &self.video {
                     video.update_texture(&self.queue);
-                    video.write_uniforms(&self.queue, self.width as f32, self.height as f32, elapsed);
-                    video.render(&view, &mut encoder);
+                    video.write_uniforms(&self.queue, w, h, elapsed);
+                    video.render(view, encoder);
                 } else {
-                    self.aurora.write_uniforms(&self.queue, self.width as f32, self.height as f32, elapsed);
-                    self.aurora.render(&view, &mut encoder);
+                    self.aurora.write_uniforms(&self.queue, w, h, elapsed);
+                    self.aurora.render(view, encoder);
                 }
             }
         }
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-        frame.present();
-        Ok(())
     }
 
     /// 加载 .rwp 壁纸包
@@ -479,7 +530,7 @@ impl App {
                     // 直接从内存解码，不再写临时文件（避免临时图片文件泄漏）
                     let new_image = ImageWallpaper::load_from_memory(&data, &img_name, &self.device, &self.queue, format)
                         .map_err(|e| e.to_string())?;
-                    self.image = new_image;
+                    self.image = Some(new_image);
                     self.wallpaper_type = WallpaperType::Image;
                     Ok(WallpaperType::Image)
                 } else {

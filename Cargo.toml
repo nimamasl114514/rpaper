@@ -9,10 +9,12 @@ description = "Rpaper - GPU-accelerated dynamic wallpaper engine for Windows"
 embed-manifest = "1.0"
 # 编译时嵌入 Windows 资源（图标、版本信息）— 调用 Windows SDK rc.exe
 embed-resource = "2.5"
+# Slint UI 编译器
+slint-build = "1.8"
 
 [dependencies]
 wgpu = "22"
-windows = { version = "0.52", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_UI_WindowsAndMessaging",
@@ -42,6 +44,8 @@ rodio = "0.19"
 lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 # H.264 解码 — Cisco OpenH264，全 Profile 支持 (CABAC+B帧+子分区)
 openh264 = { version = "0.7", default-features = false, features = ["source"] }
+# Slint UI 框架 — 现代化壁纸库窗口
+slint = { version = "1.8", default-features = false, features = ["std", "backend-winit", "renderer-femtovg", "accessibility", "compat-1-2"] }
 
 [profile.release]
 opt-level = 3

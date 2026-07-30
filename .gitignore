@@ -24,3 +24,5 @@ scripts/test_results/
 
 # 安装包输出
 installer/Output/
+ui_prototype.html
+errors.txt

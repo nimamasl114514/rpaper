@@ -20,6 +20,7 @@ pub const IDM_VIDEO: usize = 1005;
 pub const IDM_PACKAGE: usize = 1006;
 pub const IDM_EXIT: usize = 1004;
 pub const IDM_SETTINGS: usize = 1007;
+pub const IDM_LIBRARY: usize = 1008;
 
 pub struct TrayIcon { hwnd: HWND }
 
@@ -28,8 +29,8 @@ impl TrayIcon {
         unsafe {
             // 使用自定义蓝紫 R 图标（16px 小图标，适合托盘显示）
             // 托盘图标推荐 16px，系统会自动缩放到 DPI 适配尺寸
-            let icon = load_app_icon(true);
-            if icon.0 == 0 {
+            let icon = load_app_icon();
+            if icon.0.is_null() {
                 return Err(std::io::Error::other("加载托盘图标失败"));
             }
 
@@ -53,8 +54,8 @@ impl TrayIcon {
 
     pub fn show_menu(&self, current_wallpaper: u32, has_image: bool, has_video: bool) {
         unsafe {
-            let hmenu = CreatePopupMenu().unwrap_or(HMENU(0));
-            if hmenu.0 == 0 { return; }
+            let hmenu = CreatePopupMenu().unwrap_or(HMENU(std::ptr::null_mut()));
+            if hmenu.0.is_null() { return; }
 
             let mk_flags = |checked: bool| {
                 if checked { MF_STRING | MF_CHECKED } else { MF_STRING }
@@ -69,7 +70,8 @@ impl TrayIcon {
             let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, w!(""));
             let _ = AppendMenuW(hmenu, MF_STRING, IDM_PACKAGE, w!("加载壁纸包 (.rwp)..."));
             let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, w!(""));
-            let _ = AppendMenuW(hmenu, MF_STRING, IDM_SETTINGS, w!("设置..."));
+            let _ = AppendMenuW(hmenu, MF_STRING, IDM_LIBRARY, w!("壁纸库..."));
+            let _ = AppendMenuW(hmenu, MF_STRING, IDM_SETTINGS, w!("快速设置..."));
             let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, w!(""));
             let _ = AppendMenuW(hmenu, MF_STRING, IDM_EXIT, w!("退出"));
 
@@ -79,11 +81,11 @@ impl TrayIcon {
 
             let cmd = TrackPopupMenu(
                 hmenu, TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD,
-                pt.x, pt.y, 0, self.hwnd, None,
+                pt.x, pt.y, Some(0), self.hwnd, None,
             );
             let cmd_id = cmd.0 as i32;
             if cmd_id != 0 {
-                let _ = PostMessageW(self.hwnd, WM_COMMAND, WPARAM(cmd_id as usize), LPARAM(0));
+                let _ = PostMessageW(Some(self.hwnd), WM_COMMAND, WPARAM(cmd_id as usize), LPARAM(0));
             }
             let _ = DestroyMenu(hmenu);
         }
